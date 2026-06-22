@@ -1,0 +1,56 @@
+id: prysm-lifecycle-voluntary-exits
+name: "Prysm lifecycle shard - voluntary exits"
+description: |
+  Mirrors one voluntary-exit phase of ethereum-package's lifecycle test. Run
+  once during unfinality with the defaults, or after finality recovery with
+  startIndex=150 and indexCount=50.
+version: 1.0.0
+tags: [prysm, lifecycle, voluntary-exit, assertoor]
+timeout: 90m
+
+config:
+  validatorMnemonic: "trial jeans seat abstract runway cupboard please elevator club file arrow lounge crash sun thumb clock duty priority key fence funny trick diary album"
+  validatorPairNames: []
+  startIndex: 0
+  indexCount: 100
+  limitTotal: 50
+  limitPerSlot: 1
+  awaitInclusion: false
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Check if at least one client is ready"
+    timeout: 5m
+    config:
+      minClientCount: 1
+
+  - name: run_task_background
+    title: "Check if all validator client pairs propose blocks with exits"
+    config:
+      onBackgroundComplete: "failOrIgnore"
+      backgroundTask:
+        name: generate_exits
+        title: "Generate voluntary exits"
+        configVars:
+          mnemonic: "validatorMnemonic"
+          startIndex: "startIndex"
+          indexCount: "indexCount"
+          limitTotal: "limitTotal"
+          limitPerSlot: "limitPerSlot"
+          awaitInclusion: "awaitInclusion"
+      foregroundTask:
+        name: run_task_matrix
+        title: "Check exit inclusion with all validator client pairs"
+        timeout: 1h
+        configVars:
+          matrixValues: "validatorPairNames"
+        config:
+          runConcurrent: true
+          matrixVar: "validatorPairName"
+          task:
+            name: check_consensus_block_proposals
+            title: "Wait for block proposal with exits from ${validatorPairName}"
+            configVars:
+              validatorNamePattern: "validatorPairName"
+            config:
+              minExitCount: 1

@@ -1,0 +1,114 @@
+# Example Assertoor playbook for migrating Prysm's FeeRecipientIsPresent evaluator.
+#
+# No stock Assertoor task asserts the execution-payload fee recipient
+# (check_consensus_block_proposals has no fee-recipient field), so this uses
+# run_javascript -- the same custom task already used in
+# assertoor-prysm-metrics-check.example.yaml.
+#
+# Ported (network-agnostic) assertions, matching fee_recipient.go:
+#   - every post-merge block in the previous epoch has a non-zero fee recipient
+#   - on blocks with gasUsed > 0, the fee recipient's EL balance increased
+#
+# NOT ported: the Prysm e2e check that fee_recipient == first 20 bytes of the
+# proposer pubkey (FeeRecipientFromPubkey). That only holds for the Prysm interop
+# harness's deterministic keys; in Kurtosis the VC is configured with its own
+# recipient, so the mapping does not apply.
+
+id: fee-recipient-check
+name: "Fee recipient is present in proposed blocks"
+timeout: 20m
+
+config:
+  # Beacon REST + EL JSON-RPC endpoints for one node (Kurtosis service URLs).
+  beaconUrl: "http://prysm-bn-0:3500"
+  elRpcUrl: "http://el-0:8545"
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Wait for a healthy client"
+    timeout: 5m
+    config:
+      minClientCount: 1
+
+  # Need at least one full epoch of history to look back over.
+  - name: check_consensus_slot_range
+    title: "Wait until past the first epoch"
+    timeout: 10m
+    config:
+      minEpochNumber: 2
+
+  - name: run_javascript
+    title: "Verify fee recipient present in previous epoch's blocks"
+    timeout: 5m
+    config:
+      envVars:
+        BEACON_URL: "beaconUrl"
+        EL_RPC_URL: "elRpcUrl"
+      script: |
+        const beacon = env.BEACON_URL.replace(/\/$/, "");
+        const elRpc = env.EL_RPC_URL;
+        const ZERO = "0x0000000000000000000000000000000000000000";
+
+        const spec = await getJSON(`${beacon}/eth/v1/config/spec`);
+        const slotsPerEpoch = Number(spec.data.SLOTS_PER_EPOCH);
+
+        const head = await getJSON(`${beacon}/eth/v1/beacon/headers/head`);
+        const headSlot = Number(head.data.header.message.slot);
+        const epoch = Math.floor(headSlot / slotsPerEpoch);
+        const target = epoch > 0 ? epoch - 1 : 0;
+        const start = target * slotsPerEpoch;
+
+        const checked = [];
+        const failures = [];
+
+        for (let slot = start; slot < start + slotsPerEpoch; slot++) {
+          const res = await fetch(`${beacon}/eth/v2/beacon/blocks/${slot}`);
+          if (res.status === 404) continue; // missed slot
+          if (!res.ok) throw new Error(`block ${slot}: HTTP ${res.status}`);
+          const body = (await res.json()).data.message.body;
+          const payload = body.execution_payload;
+          if (!payload || /^0x0+$/.test(payload.block_hash)) continue; // pre-merge / empty
+
+          const fr = (payload.fee_recipient || "").toLowerCase();
+          if (!fr || fr === ZERO) {
+            failures.push(`slot ${slot}: fee recipient is not set (${fr || "empty"})`);
+            continue;
+          }
+
+          // Balance must increase on blocks that burned/tipped gas.
+          if (BigInt(payload.gas_used) > 0n) {
+            const blockNum = BigInt(payload.block_number);
+            const cur = await balanceAt(fr, blockNum);
+            const prev = await balanceAt(fr, blockNum - 1n);
+            if (cur <= prev) {
+              failures.push(`slot ${slot}: fee recipient ${fr} balance did not increase (${prev} -> ${cur})`);
+              continue;
+            }
+          }
+          checked.push({ slot, feeRecipient: fr });
+        }
+
+        setOutputJSON("checkedBlocks", checked);
+        if (checked.length === 0) throw new Error(`no execution blocks found in epoch ${target}`);
+        if (failures.length > 0) throw new Error(failures.join("\n"));
+
+        async function getJSON(url) {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+          return r.json();
+        }
+
+        async function balanceAt(addr, blockNum) {
+          const r = await fetch(elRpc, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0", id: 1, method: "eth_getBalance",
+              params: [addr, "0x" + blockNum.toString(16)],
+            }),
+          });
+          if (!r.ok) throw new Error(`eth_getBalance: HTTP ${r.status}`);
+          const j = await r.json();
+          if (j.error) throw new Error(`eth_getBalance: ${j.error.message}`);
+          return BigInt(j.result);
+        }

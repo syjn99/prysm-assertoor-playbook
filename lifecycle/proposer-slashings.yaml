@@ -1,0 +1,58 @@
+id: prysm-lifecycle-proposer-slashings
+name: "Prysm lifecycle shard - proposer slashings"
+description: |
+  Mirrors one proposer-slashing phase of ethereum-package's lifecycle test.
+  Defaults match the unfinality phase. For the post-recovery finality phase,
+  use startIndex=250 and indexCount=50.
+version: 1.0.0
+tags: [prysm, lifecycle, proposer-slashing, assertoor]
+timeout: 90m
+
+config:
+  validatorMnemonic: "trial jeans seat abstract runway cupboard please elevator club file arrow lounge crash sun thumb clock duty priority key fence funny trick diary album"
+  validatorPairNames: []
+  startIndex: 100
+  indexCount: 50
+  limitTotal: 50
+  limitPerSlot: 1
+  awaitInclusion: false
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Check if at least one client is ready"
+    timeout: 5m
+    config:
+      minClientCount: 1
+
+  - name: run_task_background
+    title: "Check if all validator client pairs propose blocks with proposer slashings"
+    config:
+      onBackgroundComplete: "failOrIgnore"
+      backgroundTask:
+        name: generate_slashings
+        title: "Generate proposer slashings"
+        configVars:
+          mnemonic: "validatorMnemonic"
+          startIndex: "startIndex"
+          indexCount: "indexCount"
+          limitTotal: "limitTotal"
+          limitPerSlot: "limitPerSlot"
+          awaitInclusion: "awaitInclusion"
+        config:
+          slashingType: "proposer"
+      foregroundTask:
+        name: run_task_matrix
+        title: "Check proposer slashing inclusion with all validator client pairs"
+        timeout: 1h
+        configVars:
+          matrixValues: "validatorPairNames"
+        config:
+          runConcurrent: true
+          matrixVar: "validatorPairName"
+          task:
+            name: check_consensus_block_proposals
+            title: "Wait for block proposal with proposer slashings from ${validatorPairName}"
+            configVars:
+              validatorNamePattern: "validatorPairName"
+            config:
+              minProposerSlashingCount: 1

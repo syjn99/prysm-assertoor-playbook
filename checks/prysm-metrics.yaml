@@ -1,0 +1,290 @@
+# Example Assertoor playbook for migrating Prysm's MetricsCheck evaluator.
+#
+# This file is intentionally illustrative:
+# - check_http_metrics is a built-in Assertoor task in the assertoor checkout.
+# - The ratio checks use run_javascript as a prototype. For a production
+#   migration, prefer extending check_http_metrics with ratio/aggregate selectors.
+
+id: prysm-metrics-check
+name: "Prysm metrics sanity check"
+timeout: 20m
+
+config:
+  # In Kurtosis, populate these with the exposed/container metrics URLs for each
+  # Prysm beacon node service.
+  prysmMetricsUrls:
+    - "http://prysm-bn-0:8080/metrics"
+    - "http://prysm-bn-1:8080/metrics"
+
+  # Match the Assertoor consensus endpoint names for Prysm beacon nodes.
+  prysmClientPattern: "^prysm.*"
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Wait for Prysm clients to be healthy"
+    timeout: 5m
+    configVars:
+      clientPattern: "prysmClientPattern"
+    config:
+      minClientCount: 1
+      skipExecutionCheck: true
+
+  - name: check_consensus_slot_range
+    title: "Wait until metrics sample size is past genesis epoch"
+    timeout: 5m
+    config:
+      minEpochNumber: 1
+
+  - name: check_consensus_sync_status
+    title: "Check Prysm heads are synced and progressing"
+    timeout: 5m
+    configVars:
+      clientPattern: "prysmClientPattern"
+    config:
+      expectSyncing: false
+      expectOptimistic: false
+      minSlotHeight: 1
+      waitForChainProgression: true
+
+  - name: run_task_matrix
+    title: "Check each Prysm beacon node metrics endpoint"
+    timeout: 5m
+    configVars:
+      matrixValues: "prysmMetricsUrls"
+    config:
+      runConcurrent: true
+      matrixVar: "metricsUrl"
+      task:
+        name: run_tasks
+        title: "Metrics checks for ${metricsUrl}"
+        config:
+          tasks:
+            - name: check_http_metrics
+              title: "Check memory usage for ${metricsUrl}"
+              timeout: 30s
+              configVars:
+                url: "metricsUrl"
+              config:
+                pollInterval: 5s
+                requestTimeout: 5s
+                failOnCheckMiss: true
+                missingMetric: fail
+                missingSeries: fail
+                assertions:
+                  - name: memory_usage_under_2gib
+                    metric: go_memstats_alloc_bytes
+                    operator: lt
+                    value: 2000000000
+
+            # Prototype implementation of the metric-to-metric ratio checks.
+            # This uses only existing Assertoor functionality. A production
+            # version should likely become a check_http_metrics extension.
+            - name: run_javascript
+              title: "Check cache and P2P ratios for ${metricsUrl}"
+              timeout: 30s
+              config:
+                envVars:
+                  METRICS_URL: "metricsUrl"
+                script: |
+                  const metricsUrl = env.METRICS_URL;
+                  if (!metricsUrl) {
+                    throw new Error("METRICS_URL was not provided");
+                  }
+
+                  const response = await fetch(metricsUrl);
+                  if (!response.ok) {
+                    throw new Error(`metrics scrape failed: HTTP ${response.status}`);
+                  }
+
+                  const text = await response.text();
+                  const series = parsePrometheusText(text);
+                  const results = {};
+                  const failures = [];
+
+                  checkRatio({
+                    name: "committee_cache_miss_rate",
+                    numerator: {metric: "committee_cache_miss"},
+                    denominator: {metric: "committee_cache_hit"},
+                    maxRatio: 0.01,
+                  });
+
+                  checkRatio({
+                    name: "hot_state_cache_miss_rate",
+                    numerator: {metric: "hot_state_cache_miss"},
+                    denominator: {metric: "hot_state_cache_hit"},
+                    maxRatio: 0.01,
+                  });
+
+                  checkRatio({
+                    name: "aggregate_and_proof_failed_validation_rate",
+                    numerator: {
+                      metric: "p2p_message_failed_validation_total",
+                      labelsRegex: {
+                        topic: "^/eth2/[0-9a-fA-F]{8}/beacon_aggregate_and_proof/ssz_snappy$",
+                      },
+                      missing: "pass",
+                    },
+                    denominator: {
+                      metric: "p2p_message_received_total",
+                      labelsRegex: {
+                        topic: "^/eth2/[0-9a-fA-F]{8}/beacon_aggregate_and_proof/ssz_snappy$",
+                      },
+                    },
+                    maxRatio: 0.8,
+                  });
+
+                  checkRatio({
+                    name: "attestation_failed_validation_rate",
+                    numerator: {
+                      metric: "p2p_message_failed_validation_total",
+                      labelsRegex: {
+                        topic: "^/eth2/[0-9a-fA-F]{8}/beacon_attestation_[0-9]+/ssz_snappy$",
+                      },
+                      missing: "pass",
+                    },
+                    denominator: {
+                      metric: "p2p_message_received_total",
+                      labelsRegex: {
+                        topic: "^/eth2/[0-9a-fA-F]{8}/beacon_attestation_[0-9]+/ssz_snappy$",
+                      },
+                    },
+                    maxRatio: 0.15,
+                  });
+
+                  setOutputJSON("ratioValues", results);
+
+                  if (failures.length > 0) {
+                    throw new Error(failures.join("\n"));
+                  }
+
+                  function checkRatio(assertion) {
+                    const numerator = sumSeries(assertion.numerator);
+                    const denominator = sumSeries(assertion.denominator);
+
+                    if (numerator.missing && assertion.numerator.missing === "pass") {
+                      results[assertion.name] = {
+                        numerator: 0,
+                        denominator: denominator.value,
+                        ratio: 0,
+                        passed: true,
+                        note: "missing numerator treated as zero",
+                      };
+                      return;
+                    }
+
+                    if (numerator.missing) {
+                      failures.push(`${assertion.name}: missing numerator metric ${assertion.numerator.metric}`);
+                      return;
+                    }
+
+                    if (denominator.missing) {
+                      failures.push(`${assertion.name}: missing denominator metric ${assertion.denominator.metric}`);
+                      return;
+                    }
+
+                    if (denominator.value === 0) {
+                      results[assertion.name] = {
+                        numerator: numerator.value,
+                        denominator: 0,
+                        ratio: 0,
+                        passed: true,
+                        note: "zero denominator treated as pass",
+                      };
+                      return;
+                    }
+
+                    const ratio = numerator.value / denominator.value;
+                    const passed = ratio < assertion.maxRatio;
+                    results[assertion.name] = {
+                      numerator: numerator.value,
+                      denominator: denominator.value,
+                      ratio,
+                      maxRatio: assertion.maxRatio,
+                      passed,
+                    };
+
+                    if (!passed) {
+                      failures.push(
+                        `${assertion.name}: ratio ${ratio} >= ${assertion.maxRatio} ` +
+                        `(${numerator.value}/${denominator.value})`,
+                      );
+                    }
+                  }
+
+                  function sumSeries(selector) {
+                    let matched = 0;
+                    let value = 0;
+
+                    for (const sample of series) {
+                      if (sample.metric !== selector.metric) {
+                        continue;
+                      }
+
+                      if (!labelsMatch(sample.labels, selector.labelsRegex || {})) {
+                        continue;
+                      }
+
+                      matched += 1;
+                      value += sample.value;
+                    }
+
+                    return {
+                      value,
+                      matched,
+                      missing: matched === 0,
+                    };
+                  }
+
+                  function labelsMatch(labels, regexByLabel) {
+                    for (const [name, pattern] of Object.entries(regexByLabel)) {
+                      const value = labels[name] || "";
+                      if (!new RegExp(pattern).test(value)) {
+                        return false;
+                      }
+                    }
+                    return true;
+                  }
+
+                  function parsePrometheusText(input) {
+                    const parsed = [];
+                    const samplePattern =
+                      /^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|NaN|\+Inf|-Inf)\b/;
+
+                    for (const line of input.split(/\r?\n/)) {
+                      if (!line || line.startsWith("#")) {
+                        continue;
+                      }
+
+                      const match = line.match(samplePattern);
+                      if (!match) {
+                        continue;
+                      }
+
+                      const value = Number(match[3]);
+                      if (!Number.isFinite(value)) {
+                        continue;
+                      }
+
+                      parsed.push({
+                        metric: match[1],
+                        labels: parseLabels(match[2] || ""),
+                        value,
+                      });
+                    }
+
+                    return parsed;
+                  }
+                  function parseLabels(input) {
+                    const labels = {};
+                    const labelPattern = /([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"/g;
+                    let match;
+
+                    while ((match = labelPattern.exec(input)) !== null) {
+                      labels[match[1]] = match[2]
+                        .replace(/\\"/g, '"')
+                        .replace(/\\\\/g, "\\")
+                        .replace(/\\n/g, "\n");
+                    }
+
+                    return labels;
+                  }

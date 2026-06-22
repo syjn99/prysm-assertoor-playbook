@@ -1,0 +1,18 @@
+id: prysm-lifecycle-health
+name: "Prysm lifecycle shard - health"
+description: |
+  Smallest shard of ethereum-package's run_lifecycle_test. It only waits for
+  Assertoor to see at least one ready client.
+version: 1.0.0
+tags: [prysm, lifecycle, health, assertoor]
+timeout: 5m
+
+config:
+  minClientCount: 1
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Check if at least one client is ready"
+    timeout: 5m
+    configVars:
+      minClientCount: "minClientCount"

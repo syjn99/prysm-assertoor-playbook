@@ -1,0 +1,18 @@
+id: prysm-lifecycle-unfinality-check
+name: "Prysm lifecycle shard - unfinality check"
+description: |
+  Mirrors the lifecycle test's post-deposit unfinality assertion. Run this
+  after the deposit shard has activated enough new validators to stall finality.
+version: 1.0.0
+tags: [prysm, lifecycle, finality, unfinality, assertoor]
+timeout: 5m
+
+config:
+  minUnfinalizedEpochs: 5
+
+tasks:
+  - name: check_consensus_finality
+    title: "Check for consensus chain unfinality"
+    timeout: 1m
+    configVars:
+      minUnfinalizedEpochs: "minUnfinalizedEpochs"

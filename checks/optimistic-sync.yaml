@@ -1,0 +1,107 @@
+# Example Assertoor playbook for migrating Prysm's OptimisticSyncEnabled
+# evaluator from testing/endtoend/evaluators/execution_engine.go.
+#
+# Assertoor already exposes the core assertion via check_consensus_sync_status:
+#   expectOptimistic: true
+#
+# The scenario still needs an external fault hook. Point the selected beacon
+# node(s) at an Engine API proxy that can be toggled so engine_newPayload* and,
+# for clients that need it, engine_forkchoiceUpdated* return payload status
+# SYNCING. In the current Go E2E this is done through EngineProxy interceptors;
+# in Kurtosis this should be a proxy admin command or service exec.
+
+id: prysm-optimistic-sync-check
+name: "Prysm optimistic sync transition check"
+timeout: 20m
+
+config:
+  # Must match only clients whose Engine API proxy will be toggled by the fault
+  # commands below. For the old minimal scenario this is normally one Prysm BN;
+  # for the multiclient scenario include every BN whose proxy returns SYNCING.
+  optimisticClientPattern: "^prysm.*"
+
+  # Optional timing guards. Set optimisticStartEpoch to the epoch where the
+  # proxy fault should be enabled. A value of 0 means "start immediately".
+  optimisticStartEpoch: 0
+
+  # These are intentionally supplied by the parent test/Kurtosis config.
+  # Examples:
+  #   curl -fsS -X POST http://engine-proxy-admin/fault/syncing
+  #   kurtosis service exec <enclave> <proxy-service> 'proxyctl syncing on'
+  enableOptimisticFaultCommand: ""
+  disableOptimisticFaultCommand: ""
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Wait for selected consensus clients to be healthy"
+    timeout: 5m
+    configVars:
+      clientPattern: "optimisticClientPattern"
+    config:
+      minClientCount: 1
+      skipExecutionCheck: true
+
+  - name: check_consensus_sync_status
+    title: "Check selected clients start non-optimistic"
+    timeout: 2m
+    configVars:
+      clientPattern: "optimisticClientPattern"
+    config:
+      expectSyncing: false
+      expectOptimistic: false
+      minSlotHeight: 1
+
+  - name: check_consensus_slot_range
+    title: "Wait for optimistic-sync fault epoch"
+    timeout: 10m
+    configVars:
+      minEpochNumber: "optimisticStartEpoch"
+    config:
+      failIfLower: false
+
+  - name: run_shell
+    title: "Enable Engine API SYNCING fault"
+    timeout: 1m
+    configVars:
+      command: "enableOptimisticFaultCommand"
+    config:
+      shell: bash
+
+  - name: check_consensus_sync_status
+    title: "Check selected clients become optimistic"
+    timeout: 5m
+    configVars:
+      clientPattern: "optimisticClientPattern"
+    config:
+      expectSyncing: false
+      expectOptimistic: true
+      minSlotHeight: 1
+      waitForChainProgression: true
+
+  - name: run_shell
+    title: "Disable Engine API SYNCING fault"
+    timeout: 1m
+    configVars:
+      command: "disableOptimisticFaultCommand"
+    config:
+      shell: bash
+
+  - name: check_consensus_sync_status
+    title: "Check selected clients recover from optimistic mode"
+    timeout: 10m
+    configVars:
+      clientPattern: "optimisticClientPattern"
+    config:
+      expectSyncing: false
+      expectOptimistic: false
+      minSlotHeight: 1
+      waitForChainProgression: true
+
+cleanupTasks:
+  - name: run_shell
+    title: "Best-effort disable Engine API SYNCING fault"
+    timeout: 1m
+    configVars:
+      command: "| if .disableOptimisticFaultCommand == \"\" then \"true\" else .disableOptimisticFaultCommand + \" || true\" end"
+    config:
+      shell: bash

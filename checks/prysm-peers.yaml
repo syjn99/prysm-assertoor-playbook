@@ -1,0 +1,116 @@
+# Example Assertoor playbook for migrating Prysm's PeersCheck evaluator.
+#
+# PeersCheck is Prysm-specific: it reads the deprecated
+# ethereum.eth.v1alpha1.Debug/ListPeers API and checks peer-score internals.
+# Standard Beacon API peer/health endpoints do not expose these fields.
+#
+# Expose Prysm's gRPC RPC port, keep server reflection enabled, and ensure
+# grpcurl + jq are available in the assertoor container.
+
+id: prysm-peers-check
+name: "Prysm peer score check"
+timeout: 10m
+
+config:
+  # Match Assertoor consensus endpoint names for Prysm beacon nodes.
+  prysmClientPattern: "^prysm.*"
+
+  # Set this to the epoch immediately after the transition you want to inspect.
+  # This mirrors the evaluator's AfterNthEpoch(0) shape while making fork or
+  # scenario transition checks explicit.
+  minEpochNumber: 1
+
+  # These are host:port pairs for Prysm's --rpc-port.
+  prysmGrpcTargets:
+    - "prysm-bn-0:4000"
+    - "prysm-bn-1:4000"
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Wait for Prysm clients to be healthy"
+    timeout: 5m
+    configVars:
+      clientPattern: "prysmClientPattern"
+    config:
+      minClientCount: 1
+      skipExecutionCheck: true
+
+  - name: check_consensus_slot_range
+    title: "Wait for peer score sampling epoch"
+    timeout: 5m
+    configVars:
+      minEpochNumber: "minEpochNumber"
+
+  - name: run_task_matrix
+    title: "Check Prysm peer scores via gRPC"
+    timeout: 2m
+    configVars:
+      matrixValues: "prysmGrpcTargets"
+    config:
+      runConcurrent: true
+      matrixVar: "grpcTarget"
+      task:
+        name: run_shell
+        title: "Peer score check for ${grpcTarget}"
+        timeout: 30s
+        config:
+          shell: bash
+          envVars:
+            GRPC_TARGET: "grpcTarget"
+          command: |
+            set -euo pipefail
+
+            response="$(grpcurl -plaintext -max-time 15 -d '{}' "$GRPC_TARGET" ethereum.eth.v1alpha1.Debug/ListPeers)"
+            peer_count="$(printf '%s' "$response" | jq -r '(.responses // []) | length')"
+
+            violations="$(printf '%s' "$response" | jq -r '
+              .responses[]? as $p
+              | ($p.scoreInfo // $p.score_info // {}) as $s
+              | ($p.peerInfo // $p.peer_info // {}) as $info
+              | ($p.peerId // $p.peer_id // "<unknown>") as $peer
+              | (
+                  if (($s.gossipScore // $s.gossip_score // 0) < 0) then
+                    "peer \($peer) has negative gossip_score=\($s.gossipScore // $s.gossip_score)"
+                  else empty end
+                ),
+                (
+                  if (($s.behaviourPenalty // $s.behaviour_penalty // 0) > 0) then
+                    "peer \($peer) has behaviour_penalty=\($s.behaviourPenalty // $s.behaviour_penalty)"
+                  else empty end
+                ),
+                (
+                  if (($s.blockProviderScore // $s.block_provider_score // 0) < 0) then
+                    "peer \($peer) has negative block_provider_score=\($s.blockProviderScore // $s.block_provider_score)"
+                  else empty end
+                ),
+                (
+                  if (($s.overallScore // $s.overall_score // 0) < 0) then
+                    "peer \($peer) has negative overall_score=\($s.overallScore // $s.overall_score)"
+                  else empty end
+                ),
+                (
+                  if ((($s.validationError // $s.validation_error // "") | tostring) != "") then
+                    "peer \($peer) has validation_error=\($s.validationError // $s.validation_error)"
+                  else empty end
+                ),
+                (
+                  if (($info.faultCount // $info.fault_count // 0) > 0) then
+                    "peer \($peer) has fault_count=\($info.faultCount // $info.fault_count)"
+                  else empty end
+                ),
+                (
+                  ($s.topicScores // $s.topic_scores // {})
+                  | to_entries[]?
+                  | select((.value.invalidMessageDeliveries // .value.invalid_message_deliveries // 0) > 0)
+                  | "peer \($peer) topic \(.key) has invalid_message_deliveries=\(.value.invalidMessageDeliveries // .value.invalid_message_deliveries)"
+                )
+            ')"
+
+            echo "::set-output peerCount $peer_count"
+
+            if [ -n "$violations" ]; then
+              printf '%s\n' "$violations"
+              exit 1
+            fi
+
+            echo "No Prysm peer-score violations on $GRPC_TARGET ($peer_count peers checked)"

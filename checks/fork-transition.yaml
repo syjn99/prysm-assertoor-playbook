@@ -1,0 +1,87 @@
+id: prysm-fork-transition-check
+name: "Prysm fork transition check"
+timeout: 10m
+
+# This playbook is an example replacement for Prysm's *ForkTransition
+# evaluators in testing/endtoend/evaluators/fork.go.
+#
+# The Go evaluators wait until the configured fork epoch, receive a verified
+# block, then assert that the returned block is the post-fork block variant and
+# that its slot is at or past the fork start slot.
+#
+# The Assertoor replacement uses check_consensus_api against
+# /eth/v2/beacon/blocks/head. This uses the assertoor consensus client pool and
+# checks the Beacon API block version.
+#
+# Set these values from the parent assertoor test config. For Prysm's minimal
+# e2e scenario, the interesting case is usually:
+#   forkName: "fulu"
+#   forkEpoch: 2
+config:
+  forkName: "fulu"
+  forkEpoch: 2
+  clientPattern: ""
+
+tasks:
+  - name: get_consensus_specs
+    id: specs
+    title: "Load consensus specs"
+
+  - name: check_consensus_slot_range
+    id: wait_for_fork_epoch
+    title: "Wait for fork epoch"
+    timeout: 5m
+    configVars:
+      minEpochNumber: "forkEpoch"
+    config:
+      failIfLower: false
+
+  # This is the replacement when assertoor is connected to the CL endpoints
+  # through its normal endpoint pool. The `version` field in
+  # /eth/v2/beacon/blocks/{block_id} is the Beacon API fork/version name
+  # ("phase0", "altair", "bellatrix", "capella", "deneb", "electra",
+  # "fulu", ...). A wrong pre-fork block version becomes a schema mismatch.
+  #
+  # NOTE: `requireForkActive` is only a gate inside check_consensus_api. It uses
+  # head slot >= <FORK>_FORK_EPOCH * SLOTS_PER_EPOCH to skip inactive clients,
+  # and skipped clients are not failures when another client passes. For a
+  # transition evaluator replacement, leave that gate off and let stale/pre-fork
+  # clients fail the JSON schema `version.const`.
+  - name: check_consensus_api
+    id: head_block_has_fork_version
+    title: "Check head block fork version via Beacon API"
+    timeout: 2m
+    configVars:
+      clientPattern: "clientPattern"
+      rowId: "| \"fork_transition_\" + .forkName"
+      rowTitle: "| \"GET /eth/v2/beacon/blocks/head has version \" + .forkName"
+      responseSchema: |
+        | {
+            type: "object",
+            required: ["version", "data"],
+            properties: {
+              version: { const: .forkName },
+              data: {
+                type: "object",
+                required: ["message"],
+                properties: {
+                  message: {
+                    type: "object",
+                    required: ["slot"],
+                    properties: {
+                      slot: { type: "string", pattern: "^[0-9]+$" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+    config:
+      method: "GET"
+      path: "/eth/v2/beacon/blocks/head"
+      expectStatuses: [200]
+      successStatuses: [200]
+      failOnAnyError: true
+      failOnAllError: true
+      requestTimeout: "15s"
+      overallTimeout: "60s"

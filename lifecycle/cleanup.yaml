@@ -1,0 +1,37 @@
+id: prysm-lifecycle-cleanup
+name: "Prysm lifecycle shard - cleanup"
+description: |
+  Standalone version of the lifecycle test cleanup tasks. It exits all
+  lifecycle validators and generates BLS changes for all lifecycle validators.
+version: 1.0.0
+tags: [prysm, lifecycle, cleanup, voluntary-exit, bls-change, assertoor]
+timeout: 4h
+
+config:
+  validatorMnemonic: "trial jeans seat abstract runway cupboard please elevator club file arrow lounge crash sun thumb clock duty priority key fence funny trick diary album"
+  cleanupValidatorCount: 300
+  targetAddress: "0x65D08a056c17Ae13370565B04cF77D2AfA1cB9FA"
+
+tasks:
+  - name: run_task_options
+    title: "Exit all lifecycle validators"
+    config:
+      task:
+        name: generate_exits
+        title: "Exit all lifecycle validators"
+        configVars:
+          mnemonic: "validatorMnemonic"
+          limitTotal: "cleanupValidatorCount"
+          indexCount: "cleanupValidatorCount"
+
+  - name: run_task_options
+    title: "Generate BLS changes for all lifecycle validators"
+    config:
+      task:
+        name: generate_bls_changes
+        title: "Generate BLS changes for all lifecycle validators"
+        configVars:
+          mnemonic: "validatorMnemonic"
+          limitTotal: "cleanupValidatorCount"
+          indexCount: "cleanupValidatorCount"
+          targetAddress: "targetAddress"

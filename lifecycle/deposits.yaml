@@ -1,0 +1,99 @@
+id: prysm-lifecycle-deposits
+name: "Prysm lifecycle shard - deposits and activation"
+description: |
+  Mirrors the deposit phase of ethereum-package's validator lifecycle test:
+  generate lifecycle deposits, best-effort watch every validator client pair
+  propose at least one deposit block, then wait for the last deposited validator
+  to become active.
+version: 1.0.0
+tags: [prysm, lifecycle, deposits, activation, assertoor]
+timeout: 54h
+
+config:
+  walletPrivkey: ""
+  validatorMnemonic: "trial jeans seat abstract runway cupboard please elevator club file arrow lounge crash sun thumb clock duty priority key fence funny trick diary album"
+  validatorPairNames: []
+  depositContract: "0x00000000219ab540356cBB839Cbe05303d7705Fa"
+  depositTotal: 300
+  depositPerSlot: 20
+  depositPendingLimit: 50
+
+  # This is the upstream lifecycle test's validator pubkey for the last
+  # deposited key under validatorMnemonic. If depositTotal/mnemonic changes,
+  # update this value or replace the activation check with your own target.
+  lastDepositPubKey: "0xa4a6121cb76eaf63e520615368a21d504c6f7363b5045f965e3587f623a6f7f1ce32af63ce3c535e75cd831db27c5abd"
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Check if at least one client is ready"
+    timeout: 5m
+    config:
+      minClientCount: 1
+
+  - name: run_tasks_concurrent
+    title: "Generate deposits and track inclusion"
+    config:
+      tasks:
+        - name: generate_deposits
+          title: "Generate lifecycle deposits"
+          configVars:
+            limitTotal: "depositTotal"
+            limitPerSlot: "depositPerSlot"
+            limitPending: "depositPendingLimit"
+            depositContract: "depositContract"
+            walletPrivkey: "walletPrivkey"
+            mnemonic: "validatorMnemonic"
+          config:
+            awaitReceipt: true
+
+        - name: run_task_background
+          title: "Check deposit inclusion with all validator client pairs"
+          config:
+            # This matches the upstream lifecycle test: deposit proposal by
+            # every pair is useful signal, but the hard gate is the later
+            # validator-status check for the last deposited pubkey.
+            onBackgroundComplete: "succeed"
+            backgroundTask:
+              name: run_tasks
+              title: "Await end of next deposit voting period"
+              config:
+                tasks:
+                  - name: check_consensus_validator_status
+                    title: "Wait for inclusion of the last deposit"
+                    configVars:
+                      validatorPubKey: "lastDepositPubKey"
+                    config:
+                      validatorStatus:
+                        - pending_initialized
+                        - pending_queued
+                        - active_ongoing
+            foregroundTask:
+              name: run_task_options
+              title: "Best-effort block proposal check for deposits"
+              config:
+                ignoreFailure: true
+                task:
+                  name: run_task_matrix
+                  title: "Check deposit inclusion with all validator client pairs"
+                  timeout: 48h
+                  configVars:
+                    matrixValues: "validatorPairNames"
+                  config:
+                    runConcurrent: true
+                    matrixVar: "validatorPairName"
+                    task:
+                      name: check_consensus_block_proposals
+                      title: "Wait for block proposal with deposits from ${validatorPairName}"
+                      configVars:
+                        validatorNamePattern: "validatorPairName"
+                      config:
+                        minDepositCount: 1
+
+  - name: check_consensus_validator_status
+    title: "Wait for the last deposit to become activated"
+    timeout: 48h
+    configVars:
+      validatorPubKey: "lastDepositPubKey"
+    config:
+      validatorStatus:
+        - active_ongoing

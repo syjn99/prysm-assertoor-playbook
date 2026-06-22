@@ -1,0 +1,269 @@
+# Example Assertoor playbook for migrating Prysm's ValidatorSyncParticipation
+# evaluator from testing/endtoend/evaluators/validator.go.
+#
+# Assertoor does not have a built-in sync-committee participation task today.
+# This playbook uses built-in orchestration tasks plus run_javascript to query
+# Beacon API blocks and count body.sync_aggregate.sync_committee_bits.
+
+id: prysm-validator-sync-participation-check
+name: "Prysm validator sync committee participation check"
+timeout: 20m
+
+config:
+  # Populate these with the consensus Beacon API base URLs for the nodes to
+  # check. In Kurtosis these are usually service/container URLs.
+  consensusUrls:
+    - "http://prysm-bn-0:3500"
+
+  # Optional Assertoor endpoint selection for the health check. This uses the
+  # normal Assertoor client pool; consensusUrls above are passed to the custom
+  # scan task.
+  clientPattern: "^prysm.*"
+
+  minSyncParticipation: 0.95
+  altairEpochMinSyncParticipation: 0.90
+  requireCheckedBlocks: true
+  requestTimeoutMs: 5000
+
+tasks:
+  - name: check_clients_are_healthy
+    title: "Wait for selected consensus clients to be healthy"
+    timeout: 5m
+    configVars:
+      clientPattern: "clientPattern"
+    config:
+      minClientCount: 1
+      skipExecutionCheck: true
+
+  - name: get_consensus_specs
+    id: specs
+    title: "Load consensus specs"
+
+  - name: check_consensus_slot_range
+    id: wait_for_altair
+    title: "Wait until Altair is active"
+    timeout: 10m
+    configVars:
+      minEpochNumber: "| (.tasks.specs.outputs.specs.ALTAIR_FORK_EPOCH | tonumber)"
+    config:
+      failIfLower: false
+
+  - name: run_task_matrix
+    title: "Check sync committee participation on each consensus endpoint"
+    timeout: 10m
+    configVars:
+      matrixValues: "consensusUrls"
+    config:
+      runConcurrent: true
+      matrixVar: "consensusUrl"
+      task:
+        name: run_javascript
+        title: "Check sync committee participation for ${consensusUrl}"
+        timeout: 5m
+        config:
+          envVars:
+            CONSENSUS_URL: "consensusUrl"
+            SPECS: "tasks.specs.outputs.specs"
+            MIN_SYNC_PARTICIPATION: "minSyncParticipation"
+            ALTAIR_EPOCH_MIN_SYNC_PARTICIPATION: "altairEpochMinSyncParticipation"
+            REQUIRE_CHECKED_BLOCKS: "requireCheckedBlocks"
+            REQUEST_TIMEOUT_MS: "requestTimeoutMs"
+          script: |
+            const BIT_COUNT = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+
+            const baseUrl = String(env.CONSENSUS_URL || "").replace(/\/+$/, "");
+            if (!baseUrl) {
+              throw new Error("CONSENSUS_URL was not provided");
+            }
+
+            const specs = env.SPECS || {};
+            const slotsPerEpoch = specNumber("SLOTS_PER_EPOCH", 32);
+            const secondsPerSlot = specNumber("SECONDS_PER_SLOT", 12);
+            const altairForkEpoch = specNumber("ALTAIR_FORK_EPOCH");
+            const minParticipation = Number(env.MIN_SYNC_PARTICIPATION ?? 0.95);
+            const altairMinParticipation = Number(env.ALTAIR_EPOCH_MIN_SYNC_PARTICIPATION ?? 0.90);
+            const requireCheckedBlocks = env.REQUIRE_CHECKED_BLOCKS !== false;
+            const requestTimeoutMs = Number(env.REQUEST_TIMEOUT_MS ?? 5000);
+
+            if (!Number.isFinite(altairForkEpoch)) {
+              throw new Error("ALTAIR_FORK_EPOCH is not available or is set to far future");
+            }
+
+            const genesis = await getJson("/eth/v1/beacon/genesis");
+            const genesisTime = Number(genesis.data.genesis_time);
+            const currentSlot = Math.max(0, Math.floor((Date.now() / 1000 - genesisTime) / secondsPerSlot));
+            const currentEpoch = Math.floor(currentSlot / slotsPerEpoch);
+            let lowestEpoch = currentEpoch >= 1 ? currentEpoch - 1 : 0;
+            if (lowestEpoch < altairForkEpoch) {
+              lowestEpoch = altairForkEpoch;
+            }
+
+            const epochs = [lowestEpoch];
+            if (currentEpoch !== lowestEpoch) {
+              epochs.push(currentEpoch);
+            }
+
+            const forkEpochs = [
+              "ALTAIR_FORK_EPOCH",
+              "BELLATRIX_FORK_EPOCH",
+              "CAPELLA_FORK_EPOCH",
+              "DENEB_FORK_EPOCH",
+              "ELECTRA_FORK_EPOCH",
+              "FULU_FORK_EPOCH",
+            ].map((name) => specNumber(name, Infinity)).filter(Number.isFinite);
+
+            const checked = [];
+            const skipped = [];
+            const failures = [];
+
+            for (const epoch of epochs) {
+              const startSlot = epoch * slotsPerEpoch;
+              const endSlot = Math.min(startSlot + slotsPerEpoch - 1, currentSlot);
+              const expectedParticipation =
+                epoch === altairForkEpoch ? altairMinParticipation : minParticipation;
+
+              for (let slot = startSlot; slot <= endSlot; slot += 1) {
+                if (slot < 3) {
+                  skipped.push({slot, reason: "startup"});
+                  continue;
+                }
+
+                if (isForkTransitionSlot(slot, forkEpochs, slotsPerEpoch)) {
+                  skipped.push({slot, reason: "fork transition"});
+                  continue;
+                }
+
+                const block = await getBlock(slot);
+                if (!block) {
+                  skipped.push({slot, reason: "missed block"});
+                  continue;
+                }
+
+                const bits = block.data?.message?.body?.sync_aggregate?.sync_committee_bits;
+                if (typeof bits !== "string") {
+                  failures.push(`slot ${slot}: missing sync_aggregate.sync_committee_bits`);
+                  continue;
+                }
+
+                const bitLength = bitvectorLength(bits);
+                const participants = countHexBits(bits);
+                const threshold = Math.floor(bitLength * expectedParticipation);
+                const passed = participants >= threshold;
+                const item = {
+                  slot,
+                  epoch,
+                  participants,
+                  bitLength,
+                  threshold,
+                  expectedParticipation,
+                  passed,
+                };
+                checked.push(item);
+
+                if (!passed) {
+                  failures.push(
+                    `slot ${slot}: ${participants}/${bitLength} sync committee bits set, ` +
+                    `threshold ${threshold} (${expectedParticipation})`,
+                  );
+                }
+              }
+            }
+
+            setOutputJSON("checkedBlocks", checked);
+            setOutputJSON("skippedSlots", skipped);
+            setOutputJSON("failureMessages", failures);
+
+            const summary = [
+              `Checked sync committee participation for ${baseUrl}`,
+              ``,
+              `- current epoch: ${currentEpoch}`,
+              `- checked blocks: ${checked.length}`,
+              `- skipped slots: ${skipped.length}`,
+              `- failures: ${failures.length}`,
+              ``,
+              checked.length === 0
+                ? "No blocks were checked."
+                : "| Slot | Participants | Threshold | Pass |\n" +
+                  "|---:|---:|---:|:---:|\n" +
+                  checked.map((b) =>
+                    `| ${b.slot} | ${b.participants}/${b.bitLength} | ${b.threshold} | ${b.passed ? "yes" : "no"} |`
+                  ).join("\n"),
+            ].join("\n");
+            writeSummary(summary);
+
+            if (requireCheckedBlocks && checked.length === 0) {
+              throw new Error("no blocks with sync aggregates were checked");
+            }
+            if (failures.length > 0) {
+              throw new Error(failures.join("\n"));
+            }
+
+            async function getBlock(slot) {
+              const response = await fetchWithTimeout(`${baseUrl}/eth/v2/beacon/blocks/${slot}`);
+              if (response.status === 404) {
+                return null;
+              }
+              if (!response.ok) {
+                throw new Error(`GET block ${slot} failed: HTTP ${response.status}`);
+              }
+              return await response.json();
+            }
+
+            async function getJson(path) {
+              const response = await fetchWithTimeout(`${baseUrl}${path}`);
+              if (!response.ok) {
+                throw new Error(`GET ${path} failed: HTTP ${response.status}`);
+              }
+              return await response.json();
+            }
+
+            async function fetchWithTimeout(url) {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+              try {
+                return await fetch(url, {signal: controller.signal});
+              } finally {
+                clearTimeout(timer);
+              }
+            }
+
+            function isForkTransitionSlot(slot, epochs, slotsPerEpoch) {
+              return epochs.some((epoch) => {
+                const forkSlot = epoch * slotsPerEpoch;
+                return slot === forkSlot || slot === forkSlot + 1;
+              });
+            }
+
+            function specNumber(name, fallback) {
+              const value = specs[name];
+              if (value === undefined || value === null || value === "") {
+                if (fallback !== undefined) {
+                  return fallback;
+                }
+                throw new Error(`${name} is missing from consensus specs`);
+              }
+
+              const n = Number(value);
+              if (!Number.isFinite(n) || n > Number.MAX_SAFE_INTEGER / 2) {
+                return fallback === undefined ? Infinity : fallback;
+              }
+              return n;
+            }
+
+            function bitvectorLength(hex) {
+              const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+              return clean.length * 4;
+            }
+
+            function countHexBits(hex) {
+              const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+              let total = 0;
+              for (const ch of clean) {
+                const n = Number.parseInt(ch, 16);
+                if (!Number.isFinite(n)) {
+                  throw new Error(`invalid hex bitvector: ${hex}`);
+                }
+                total += BIT_COUNT[n];
+              }
+              return total;
+            }
